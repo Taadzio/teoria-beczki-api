@@ -1,0 +1,11 @@
+from fastapi import FastAPI
+
+app = FastAPI()
+
+@app.get("/")
+def read_root():
+    return {"message": "Teoria Beczki dzia³a ??"}
+
+@app.get("/ping")
+def ping():
+    return {"status": "ok"}
