@@ -4,7 +4,7 @@ app = FastAPI()
 
 @app.get("/")
 def read_root():
-    return {"message": "Teoria Beczki dzia≥a ??"}
+    return {"message": "Teoria Beczki dzia≈Ça ??"}
 
 @app.get("/ping")
 def ping():
