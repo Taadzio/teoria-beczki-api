@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
 import pandas as pd
+import numpy as np
+
 from fastapi import FastAPI, HTTPException
 
 app = FastAPI()
@@ -119,10 +121,31 @@ def simulate_strategy(
     max_mm: float = 8.0,
 ) -> dict:
     """
-    Symulacja dzień-po-dniu.
-    - dopływ: SMDB[mm] * area_m2 = litry
-    - pobór: wg strategii (mm) * area_m2
+    Szybka symulacja (numpy): nadal dzień-po-dniu, ale bez iterrows().
     """
+
+    # --- tablice ---
+    rain_mm = df["SMDB"].to_numpy(dtype=np.float64)
+
+    # day-of-year (liczymy raz)
+    dt = pd.to_datetime(
+        dict(year=df["ROK"].astype(int), month=df["MC"].astype(int), day=df["DZ"].astype(int)),
+        errors="coerce",
+    )
+    doy = dt.dt.dayofyear.to_numpy(dtype=np.int32)
+    in_season = (doy >= season_start_doy) & (doy <= season_end_doy)
+
+    # temperatury
+    if temp_source == "TAVG":
+        tmax = df["TMAX"].to_numpy(dtype=np.float64)
+        tmin = df["TMIN"].to_numpy(dtype=np.float64)
+        temp = (tmax + tmin) / 2.0
+        temp[np.isnan(tmax) | np.isnan(tmin)] = np.nan
+    else:
+        # "TMAX" | "TMIN" | "STD"
+        temp = df[temp_source].to_numpy(dtype=np.float64)
+
+    n = rain_mm.shape[0]
 
     storage = 0.0
     overflow_total = 0.0
@@ -132,50 +155,52 @@ def simulate_strategy(
     spill_days = 0
     empty_days = 0
 
-    # iteracja po wierszach potrzebna dla sezonu / temperatury
-    for _, row in df.iterrows():
-        rain_mm = float(row["SMDB"])
-        inflow_l = rain_mm * area_m2
+    area = float(area_m2)
+    cap = float(capacity_l)
+    base = max(0.0, float(base_mm))
 
+    for i in range(n):
         # dopływ
+        inflow_l = rain_mm[i] * area
         storage += inflow_l
-        if storage > capacity_l:
-            overflow_total += storage - capacity_l
-            storage = capacity_l
+
+        if storage > cap:
+            overflow_total += storage - cap
+            storage = cap
             spill_days += 1
 
-        # strategia poboru (mm)
-        doy = day_of_year(row)
-        in_season = season_start_doy <= doy <= season_end_doy
-
-        use_mm = max(0.0, base_mm)
+        # strategia: use_mm
+        use_mm = base
 
         if strategy == "no_rain":
-            if rain_mm >= rain_threshold_mm:
+            if rain_mm[i] >= rain_threshold_mm:
                 use_mm = 0.0
 
         elif strategy == "seasonal":
-            if not in_season:
+            if not in_season[i]:
                 use_mm = 0.0
-            elif rain_mm >= rain_threshold_mm:
+            elif rain_mm[i] >= rain_threshold_mm:
                 use_mm = 0.0
 
         elif strategy == "temp_seasonal":
-            if (not in_season) or (rain_mm >= rain_threshold_mm):
+            if (not in_season[i]) or (rain_mm[i] >= rain_threshold_mm):
                 use_mm = 0.0
             else:
-                t = temp_value(row, temp_source)
-                if t is None:
-                    use_mm = max(0.0, base_mm)
+                t = temp[i]
+                if np.isnan(t):
+                    use_mm = base
                 else:
-                    use_mm = base_mm + k * (t - t0)
-                    use_mm = clamp(use_mm, min_mm, max_mm)
+                    use_mm = base + k * (float(t) - t0)
+                    if use_mm < min_mm:
+                        use_mm = min_mm
+                    elif use_mm > max_mm:
+                        use_mm = max_mm
 
-        # pobór w litrach
-        daily_demand_l = max(0.0, use_mm) * area_m2
+        # pobór
+        daily_demand_l = max(0.0, use_mm) * area
         demand_total += daily_demand_l
 
-        take = min(storage, daily_demand_l)
+        take = storage if storage < daily_demand_l else daily_demand_l
         used_total += take
         storage -= take
 
