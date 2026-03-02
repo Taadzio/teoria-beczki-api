@@ -2,19 +2,35 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
-from typing import List, Dict, Any, Tuple
+from typing import Any, Dict, List, Literal, Optional
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 
 app = FastAPI()
 
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        # docelowo adres z Vercel, np. https://teoria-beczki-web.vercel.app
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 DATA_PATH = Path("data/base/wroclaw_synop_full_1961_2025.parquet")
+
+StrategyType = Literal["constant", "no_rain", "seasonal", "temp_seasonal"]
 
 
 @app.get("/")
 def read_root():
-    return {"message": "Teoria Beczki działa ??"}
+    return {"message": "Teoria Beczki działa ?"}
 
 
 @app.get("/ping")
@@ -54,26 +70,142 @@ def columns():
     return {"columns": list(df.columns)}
 
 
-def simulate_constant(df: pd.DataFrame, area_m2: float, daily_use_mm: float, capacity_l: float) -> dict:
+# -------------------------
+# Helpers (strategy)
+# -------------------------
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+
+def day_of_year(row: pd.Series) -> int:
+    dt = pd.Timestamp(int(row["ROK"]), int(row["MC"]), int(row["DZ"]))
+    return int(dt.dayofyear)
+
+
+def temp_value(row: pd.Series, source: str) -> Optional[float]:
+    """
+    source: "TMAX" | "TMIN" | "STD" | "TAVG"
+    """
+    if source == "TAVG":
+        tmax = row.get("TMAX")
+        tmin = row.get("TMIN")
+        if pd.notna(tmax) and pd.notna(tmin):
+            return float(tmax + tmin) / 2.0
+        return None
+
+    v = row.get(source)
+    if pd.notna(v):
+        return float(v)
+    return None
+
+
+# -------------------------
+# Simulation
+# -------------------------
+def simulate_strategy(
+    df: pd.DataFrame,
+    area_m2: float,
+    capacity_l: float,
+    *,
+    strategy: StrategyType,
+    base_mm: float,
+    rain_threshold_mm: float = 0.1,
+    season_start_doy: int = 100,
+    season_end_doy: int = 280,
+    temp_source: str = "TMAX",
+    t0: float = 20.0,
+    k: float = 0.15,
+    min_mm: float = 0.0,
+    max_mm: float = 8.0,
+) -> dict:
+    """
+    Symulacja dzień-po-dniu.
+    - dopływ: SMDB[mm] * area_m2 = litry
+    - pobór: wg strategii (mm) * area_m2
+    """
+
     storage = 0.0
     overflow_total = 0.0
     used_total = 0.0
+    demand_total = 0.0
+    deficit_total = 0.0
+    spill_days = 0
+    empty_days = 0
 
-    daily_use_l = max(0.0, daily_use_mm) * area_m2
+    # iteracja po wierszach potrzebna dla sezonu / temperatury
+    for _, row in df.iterrows():
+        rain_mm = float(row["SMDB"])
+        inflow_l = rain_mm * area_m2
 
-    for precip_mm in df["SMDB"].to_numpy():
-        inflow_l = float(precip_mm) * area_m2
+        # dopływ
         storage += inflow_l
-
         if storage > capacity_l:
-            overflow_total += (storage - capacity_l)
+            overflow_total += storage - capacity_l
             storage = capacity_l
+            spill_days += 1
 
-        take = min(storage, daily_use_l)
-        storage -= take
+        # strategia poboru (mm)
+        doy = day_of_year(row)
+        in_season = season_start_doy <= doy <= season_end_doy
+
+        use_mm = max(0.0, base_mm)
+
+        if strategy == "no_rain":
+            if rain_mm >= rain_threshold_mm:
+                use_mm = 0.0
+
+        elif strategy == "seasonal":
+            if not in_season:
+                use_mm = 0.0
+            elif rain_mm >= rain_threshold_mm:
+                use_mm = 0.0
+
+        elif strategy == "temp_seasonal":
+            if (not in_season) or (rain_mm >= rain_threshold_mm):
+                use_mm = 0.0
+            else:
+                t = temp_value(row, temp_source)
+                if t is None:
+                    use_mm = max(0.0, base_mm)
+                else:
+                    use_mm = base_mm + k * (t - t0)
+                    use_mm = clamp(use_mm, min_mm, max_mm)
+
+        # pobór w litrach
+        daily_demand_l = max(0.0, use_mm) * area_m2
+        demand_total += daily_demand_l
+
+        take = min(storage, daily_demand_l)
         used_total += take
+        storage -= take
 
-    return {"overflow_l": overflow_total, "used_l": used_total}
+        if daily_demand_l > take:
+            deficit_total += (daily_demand_l - take)
+            if storage <= 1e-9:
+                empty_days += 1
+
+    coverage = used_total / demand_total if demand_total > 0 else 1.0
+
+    return {
+        "overflow_l": overflow_total,
+        "used_l": used_total,
+        "demand_l": demand_total,
+        "deficit_l": deficit_total,
+        "coverage_ratio": coverage,
+        "spill_days": spill_days,
+        "empty_days": empty_days,
+    }
+
+
+# kompatybilność wsteczna (Twoje stare API logicznie nadal działa)
+def simulate_constant(df: pd.DataFrame, area_m2: float, daily_use_mm: float, capacity_l: float) -> dict:
+    return simulate_strategy(
+        df,
+        area_m2,
+        capacity_l,
+        strategy="constant",
+        base_mm=daily_use_mm,
+    )
 
 
 def total_rain_l(df: pd.DataFrame, area_m2: float) -> float:
@@ -91,27 +223,44 @@ def make_curve(
     step_l: float,
     mode: str,
     cap_mm_ref: float,
+    *,
+    # strategy
+    strategy: StrategyType = "constant",
+    rain_threshold_mm: float = 0.1,
+    season_start_doy: int = 100,
+    season_end_doy: int = 280,
+    temp_source: str = "TMAX",
+    t0: float = 20.0,
+    k: float = 0.15,
+    min_mm: float = 0.0,
+    max_mm: float = 8.0,
+    # cost mode
+    tank_cost_per_m3: float = 800.0,
+    overflow_cost_per_m3: float = 0.0,
+    deficit_cost_per_m3: float = 0.0,
 ) -> List[Dict[str, Any]]:
     """
     mode:
-      - "raw":  loss = alpha*overflow_l + beta*capacity_l
-      - "norm": loss = alpha*overflow_ratio + beta*capacity_ratio
-               overflow_ratio = overflow_l / total_rain_l
-               capacity_mm = capacity_l / area_m2
-               capacity_ratio = capacity_mm / cap_mm_ref
+    - "raw":  loss = alpha*overflow_l + beta*capacity_l
+    - "norm": loss = alpha*overflow_ratio + beta*capacity_ratio
+             overflow_ratio = overflow_l / total_rain_l
+             capacity_mm = capacity_l / area_m2
+             capacity_ratio = capacity_mm / cap_mm_ref
+    - "cost": loss = tank_cost_per_m3*cap_m3 + overflow_cost_per_m3*overflow_m3 + deficit_cost_per_m3*deficit_m3
     """
     if step_l <= 0 or max_capacity_l <= 0:
         raise ValueError("step_l i max_capacity_l muszą być > 0")
-    if mode not in ("raw", "norm"):
-        raise ValueError("mode musi być 'raw' albo 'norm'")
-    if cap_mm_ref <= 0:
-        raise ValueError("cap_mm_ref musi być > 0")
+
+    if mode not in ("raw", "norm", "cost"):
+        raise ValueError("mode musi być 'raw' albo 'norm' albo 'cost'")
+
+    if mode == "norm" and cap_mm_ref <= 0:
+        raise ValueError("cap_mm_ref musi być > 0 dla trybu norm")
 
     step_l_i = int(step_l)
     max_cap_i = int(max_capacity_l)
 
     rain_total = total_rain_l(df, area_m2)
-    # zabezpieczenie: gdyby seria miała same zera
     if rain_total <= 0:
         rain_total = 1.0
 
@@ -119,20 +268,46 @@ def make_curve(
 
     for cap in range(step_l_i, max_cap_i + 1, step_l_i):
         cap_l = float(cap)
-        res = simulate_constant(df, area_m2, daily_use_mm, cap_l)
+
+        res = simulate_strategy(
+            df,
+            area_m2,
+            cap_l,
+            strategy=strategy,
+            base_mm=daily_use_mm,
+            rain_threshold_mm=rain_threshold_mm,
+            season_start_doy=season_start_doy,
+            season_end_doy=season_end_doy,
+            temp_source=temp_source,
+            t0=t0,
+            k=k,
+            min_mm=min_mm,
+            max_mm=max_mm,
+        )
 
         overflow_l = float(res["overflow_l"])
         used_l = float(res["used_l"])
+        demand_l = float(res["demand_l"])
+        deficit_l = float(res["deficit_l"])
+        coverage_ratio = float(res["coverage_ratio"])
 
-        # normalizacje
         overflow_ratio = overflow_l / rain_total
-        capacity_mm = cap_l / area_m2  # bo 1 mm na 1 m2 = 1 L
-        capacity_ratio = capacity_mm / cap_mm_ref
+        capacity_mm = cap_l / area_m2
+        capacity_ratio = (capacity_mm / cap_mm_ref) if cap_mm_ref > 0 else 0.0
 
         if mode == "raw":
             loss = alpha * overflow_l + beta * cap_l
-        else:
+        elif mode == "norm":
             loss = alpha * overflow_ratio + beta * capacity_ratio
+        else:  # cost
+            cap_m3 = cap_l / 1000.0
+            overflow_m3 = overflow_l / 1000.0
+            deficit_m3 = deficit_l / 1000.0
+            loss = (
+                tank_cost_per_m3 * cap_m3
+                + overflow_cost_per_m3 * overflow_m3
+                + deficit_cost_per_m3 * deficit_m3
+            )
 
         points.append(
             {
@@ -140,14 +315,17 @@ def make_curve(
                 "capacity_m3": round(cap_l / 1000.0, 3),
                 "overflow_l": round(overflow_l, 2),
                 "used_l": round(used_l, 2),
-
-                # pola z normalizacji zawsze zwracamy (żeby WWW mogła je rysować)
+                "demand_l": round(demand_l, 2),
+                "deficit_l": round(deficit_l, 2),
+                "coverage_ratio": round(coverage_ratio, 6),
+                "spill_days": int(res["spill_days"]),
+                "empty_days": int(res["empty_days"]),
+                # normalizacje zawsze zwracamy (pod wykresy WWW)
                 "total_rain_l": round(rain_total, 2),
                 "overflow_ratio": round(overflow_ratio, 6),
                 "capacity_mm": round(capacity_mm, 3),
                 "capacity_ratio": round(capacity_ratio, 6),
-
-                "loss": round(float(loss), 6 if mode == "norm" else 2),
+                "loss": round(float(loss), 6 if mode in ("norm", "cost") else 2),
             }
         )
 
@@ -175,7 +353,6 @@ def elbow_point(points: List[Dict[str, Any]]) -> Dict[str, Any]:
     x_min, x_max = min(xs), max(xs)
     y_min, y_max = min(ys), max(ys)
 
-    # unikanie dzielenia przez zero
     dx = (x_max - x_min) or 1.0
     dy = (y_max - y_min) or 1.0
 
@@ -185,18 +362,18 @@ def elbow_point(points: List[Dict[str, Any]]) -> Dict[str, Any]:
         y = (p["overflow_l"] - y_min) / dy
         norm.append((x, y))
 
-    # prosta od pierwszego do ostatniego punktu
     x1, y1 = norm[0]
     x2, y2 = norm[-1]
 
-    # odległość punktu od prostej (w 2D) – wersja z iloczynem wektorowym
-    def dist_to_line(x0, y0) -> float:
-        return abs((y2 - y1) * x0 - (x2 - x1) * y0 + x2 * y1 - y2 * x1) / (
-            ((y2 - y1) ** 2 + (x2 - x1) ** 2) ** 0.5 or 1.0
-        )
+    def dist_to_line(x0: float, y0: float) -> float:
+        # odległość punktu od prostej w 2D (z iloczynem wektorowym)
+        num = abs((y2 - y1) * x0 - (x2 - x1) * y0 + x2 * y1 - y2 * x1)
+        den = ((y2 - y1) ** 2 + (x2 - x1) ** 2) ** 0.5 or 1.0
+        return num / den
 
     best_i = 0
     best_d = -1.0
+
     for i, (x0, y0) in enumerate(norm):
         d = dist_to_line(x0, y0)
         if d > best_d:
@@ -208,6 +385,9 @@ def elbow_point(points: List[Dict[str, Any]]) -> Dict[str, Any]:
     return out
 
 
+# -------------------------
+# Endpoints
+# -------------------------
 @app.get("/curve")
 def curve(
     area_m2: float,
@@ -219,13 +399,49 @@ def curve(
     mode: str = "raw",
     cap_mm_ref: float = 100.0,
     limit_points: int = 120,
+    # strategy params
+    strategy: StrategyType = "constant",
+    rain_threshold_mm: float = 0.1,
+    season_start_doy: int = 100,
+    season_end_doy: int = 280,
+    temp_source: str = "TMAX",
+    t0: float = 20.0,
+    k: float = 0.15,
+    min_mm: float = 0.0,
+    max_mm: float = 8.0,
+    # cost params
+    tank_cost_per_m3: float = 800.0,
+    overflow_cost_per_m3: float = 0.0,
+    deficit_cost_per_m3: float = 0.0,
 ):
     if area_m2 <= 0:
         raise HTTPException(status_code=400, detail="area_m2 musi być > 0")
 
     try:
         df = load_wroclaw()
-        points = make_curve(df, area_m2, daily_use_mm, alpha, beta, max_capacity_l, step_l, mode, cap_mm_ref)
+        points = make_curve(
+            df,
+            area_m2,
+            daily_use_mm,
+            alpha,
+            beta,
+            max_capacity_l,
+            step_l,
+            mode,
+            cap_mm_ref,
+            strategy=strategy,
+            rain_threshold_mm=rain_threshold_mm,
+            season_start_doy=season_start_doy,
+            season_end_doy=season_end_doy,
+            temp_source=temp_source,
+            t0=t0,
+            k=k,
+            min_mm=min_mm,
+            max_mm=max_mm,
+            tank_cost_per_m3=tank_cost_per_m3,
+            overflow_cost_per_m3=overflow_cost_per_m3,
+            deficit_cost_per_m3=deficit_cost_per_m3,
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -243,7 +459,7 @@ def curve(
 
     return {
         "city": "Wrocław",
-        "strategy": "constant",
+        "strategy": strategy,
         "mode": mode,
         "inputs": {
             "area_m2": area_m2,
@@ -253,6 +469,17 @@ def curve(
             "max_capacity_l": max_capacity_l,
             "step_l": step_l,
             "cap_mm_ref": cap_mm_ref,
+            "rain_threshold_mm": rain_threshold_mm,
+            "season_start_doy": season_start_doy,
+            "season_end_doy": season_end_doy,
+            "temp_source": temp_source,
+            "t0": t0,
+            "k": k,
+            "min_mm": min_mm,
+            "max_mm": max_mm,
+            "tank_cost_per_m3": tank_cost_per_m3,
+            "overflow_cost_per_m3": overflow_cost_per_m3,
+            "deficit_cost_per_m3": deficit_cost_per_m3,
         },
         "best": best,
         "points": points_out,
@@ -271,20 +498,56 @@ def simulate(
     step_l: float = 200.0,
     mode: str = "raw",
     cap_mm_ref: float = 100.0,
+    # strategy params
+    strategy: StrategyType = "constant",
+    rain_threshold_mm: float = 0.1,
+    season_start_doy: int = 100,
+    season_end_doy: int = 280,
+    temp_source: str = "TMAX",
+    t0: float = 20.0,
+    k: float = 0.15,
+    min_mm: float = 0.0,
+    max_mm: float = 8.0,
+    # cost params
+    tank_cost_per_m3: float = 800.0,
+    overflow_cost_per_m3: float = 0.0,
+    deficit_cost_per_m3: float = 0.0,
 ):
     if area_m2 <= 0:
         raise HTTPException(status_code=400, detail="area_m2 musi być > 0")
 
     try:
         df = load_wroclaw()
-        points = make_curve(df, area_m2, daily_use_mm, alpha, beta, max_capacity_l, step_l, mode, cap_mm_ref)
+        points = make_curve(
+            df,
+            area_m2,
+            daily_use_mm,
+            alpha,
+            beta,
+            max_capacity_l,
+            step_l,
+            mode,
+            cap_mm_ref,
+            strategy=strategy,
+            rain_threshold_mm=rain_threshold_mm,
+            season_start_doy=season_start_doy,
+            season_end_doy=season_end_doy,
+            temp_source=temp_source,
+            t0=t0,
+            k=k,
+            min_mm=min_mm,
+            max_mm=max_mm,
+            tank_cost_per_m3=tank_cost_per_m3,
+            overflow_cost_per_m3=overflow_cost_per_m3,
+            deficit_cost_per_m3=deficit_cost_per_m3,
+        )
         best = pick_best(points)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
     return {
         "city": "Wrocław",
-        "strategy": "constant",
+        "strategy": strategy,
         "mode": mode,
         "inputs": {
             "area_m2": area_m2,
@@ -294,6 +557,17 @@ def simulate(
             "max_capacity_l": max_capacity_l,
             "step_l": step_l,
             "cap_mm_ref": cap_mm_ref,
+            "rain_threshold_mm": rain_threshold_mm,
+            "season_start_doy": season_start_doy,
+            "season_end_doy": season_end_doy,
+            "temp_source": temp_source,
+            "t0": t0,
+            "k": k,
+            "min_mm": min_mm,
+            "max_mm": max_mm,
+            "tank_cost_per_m3": tank_cost_per_m3,
+            "overflow_cost_per_m3": overflow_cost_per_m3,
+            "deficit_cost_per_m3": deficit_cost_per_m3,
         },
         "best": best,
     }
@@ -305,6 +579,16 @@ def elbow(
     daily_use_mm: float = 2.0,
     max_capacity_l: float = 20000.0,
     step_l: float = 200.0,
+    # strategy params (żeby „kolano” działało też dla strategii wegetacyjnych)
+    strategy: StrategyType = "constant",
+    rain_threshold_mm: float = 0.1,
+    season_start_doy: int = 100,
+    season_end_doy: int = 280,
+    temp_source: str = "TMAX",
+    t0: float = 20.0,
+    k: float = 0.15,
+    min_mm: float = 0.0,
+    max_mm: float = 8.0,
 ):
     """
     Zwraca "kolano" krzywej capacity vs overflow (bez wag).
@@ -314,17 +598,46 @@ def elbow(
 
     try:
         df = load_wroclaw()
-        # tu tryb loss nie ma znaczenia, bo elbow liczymy z capacity/overflow
-        points = make_curve(df, area_m2, daily_use_mm, alpha=1.0, beta=0.0,
-                            max_capacity_l=max_capacity_l, step_l=step_l,
-                            mode="raw", cap_mm_ref=100.0)
+        points = make_curve(
+            df,
+            area_m2,
+            daily_use_mm,
+            alpha=1.0,
+            beta=0.0,
+            max_capacity_l=max_capacity_l,
+            step_l=step_l,
+            mode="raw",  # elbow bazuje na capacity/overflow, nie na loss
+            cap_mm_ref=100.0,
+            strategy=strategy,
+            rain_threshold_mm=rain_threshold_mm,
+            season_start_doy=season_start_doy,
+            season_end_doy=season_end_doy,
+            temp_source=temp_source,
+            t0=t0,
+            k=k,
+            min_mm=min_mm,
+            max_mm=max_mm,
+        )
         e = elbow_point(points)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
     return {
         "city": "Wrocław",
-        "strategy": "constant",
-        "inputs": {"area_m2": area_m2, "daily_use_mm": daily_use_mm, "max_capacity_l": max_capacity_l, "step_l": step_l},
+        "strategy": strategy,
+        "inputs": {
+            "area_m2": area_m2,
+            "daily_use_mm": daily_use_mm,
+            "max_capacity_l": max_capacity_l,
+            "step_l": step_l,
+            "rain_threshold_mm": rain_threshold_mm,
+            "season_start_doy": season_start_doy,
+            "season_end_doy": season_end_doy,
+            "temp_source": temp_source,
+            "t0": t0,
+            "k": k,
+            "min_mm": min_mm,
+            "max_mm": max_mm,
+        },
         "elbow": e,
     }
